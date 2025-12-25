@@ -21,6 +21,17 @@ Or run the launcher (creates/uses a venv and installs deps):
 ./run.sh
 ```
 
+## One-Command Setup (New Pi)
+
+After cloning this repo on another Pi:
+
+```bash
+cd ~/Documents/Pi-Experiments/world_status_dashboard
+./setup.sh
+```
+
+This creates the venv, installs dependencies, prompts for your xAI API key, and creates a `worldstatus` launcher in `~/bin`.
+
 ## Launcher Command
 
 You can create a global launcher so you can run `worldstatus` from anywhere:
