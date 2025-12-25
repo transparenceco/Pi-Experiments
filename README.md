@@ -17,6 +17,10 @@ This repository documents my journey learning Linux system development on a Rasp
 A terminal-based system monitor showing CPU, memory, temperature, and network stats in real-time. Perfect first project to learn Linux system APIs and terminal UI libraries.
 Implemented at `system_monitor_dashboard/`.
 
+### 11. **World Status Dashboard**
+At-a-glance terminal dashboard with date/time, local weather, and news summary.
+Implemented at `world_status_dashboard/`.
+
 ### 2. **Home Weather Station**
 Collect and display weather data from connected sensors. Web interface for viewing historical data and current conditions. Introduces sensor integration and data visualization.
 
