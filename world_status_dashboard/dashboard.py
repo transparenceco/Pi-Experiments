@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import curses
 import datetime as dt
+import csv
 import json
 import os
 import time
@@ -19,10 +20,12 @@ BASE_DIR = os.path.dirname(__file__)
 CACHE_DIR = os.path.join(BASE_DIR, ".cache")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 WEATHER_TTL_SECONDS = 1800
+STOCKS_TTL_SECONDS = 1800
 
 DEFAULT_QUERY = "Toronto news OR Canada news"
 DEFAULT_NEWS_SCHEDULE = ["06:00", "12:00", "20:00"]
 DEFAULT_SHOW_LINKS = True
+DEFAULT_STOCK_SYMBOLS = ["TSLA.US"]
 
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "").strip()
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4-1-fast").strip()
@@ -31,6 +34,7 @@ X_MAX_RESULTS = int(os.environ.get("X_MAX_RESULTS", "6"))
 X_SEARCH_QUERY = ""
 NEWS_SCHEDULE = []
 SHOW_LINKS = True
+STOCK_SYMBOLS = []
 
 
 WEATHER_CODES = {
@@ -149,7 +153,7 @@ def parse_schedule(value):
 
 
 def load_settings():
-    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS
+    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS
     config = load_config()
     env_query = os.environ.get("X_SEARCH_QUERY", "").strip()
     X_SEARCH_QUERY = env_query or str(config.get("x_search_query", "")).strip() or DEFAULT_QUERY
@@ -157,13 +161,18 @@ def load_settings():
     NEWS_SCHEDULE = parse_schedule(schedule) or DEFAULT_NEWS_SCHEDULE
     show_links = config.get("show_links", DEFAULT_SHOW_LINKS)
     SHOW_LINKS = bool(show_links)
+    symbols = config.get("stock_symbols", DEFAULT_STOCK_SYMBOLS)
+    if isinstance(symbols, str):
+        symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    STOCK_SYMBOLS = [s.strip().upper() for s in symbols] or DEFAULT_STOCK_SYMBOLS
 
 
-def save_settings(query, schedule, show_links):
+def save_settings(query, schedule, show_links, symbols):
     config = load_config()
     config["x_search_query"] = query
     config["news_schedule"] = schedule
     config["show_links"] = bool(show_links)
+    config["stock_symbols"] = symbols
     save_config(config)
 
 
@@ -203,6 +212,43 @@ def get_weather():
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params)
     data = fetch_json(url)
     write_cache("weather.json", data)
+    return data
+
+
+def get_stocks():
+    cached = read_cache("stocks.json", STOCKS_TTL_SECONDS)
+    if cached:
+        return cached
+
+    symbols = [s.lower() for s in STOCK_SYMBOLS]
+    if not symbols:
+        return {"items": []}
+    url = "https://stooq.com/q/l/?s=" + ",".join(symbols) + "&f=sd2t2ohlcv&h&e=csv"
+    try:
+        with urllib.request.urlopen(url, timeout=6) as resp:
+            body = resp.read().decode("utf-8")
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    items = []
+    reader = csv.DictReader(body.splitlines())
+    for row in reader:
+        if not row:
+            continue
+        items.append(
+            {
+                "symbol": row.get("Symbol", ""),
+                "date": row.get("Date", ""),
+                "time": row.get("Time", ""),
+                "open": row.get("Open", ""),
+                "high": row.get("High", ""),
+                "low": row.get("Low", ""),
+                "close": row.get("Close", ""),
+                "volume": row.get("Volume", ""),
+            }
+        )
+    data = {"items": items}
+    write_cache("stocks.json", data)
     return data
 
 
@@ -343,6 +389,32 @@ def fmt_time(ts):
         return ts
 
 
+def to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_num(value, digits=2):
+    if value is None:
+        return "N/A"
+    return f"{value:.{digits}f}"
+
+
+def fmt_volume(value):
+    num = to_float(value)
+    if num is None:
+        return "N/A"
+    if num >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.1f}B"
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.1f}M"
+    if num >= 1_000:
+        return f"{num / 1_000:.1f}K"
+    return f"{num:.0f}"
+
+
 def safe_addstr(stdscr, y, x, text):
     try:
         stdscr.addstr(y, x, text)
@@ -398,7 +470,7 @@ def prompt_input(stdscr, y, prompt, current, width):
 
 
 def settings_screen(stdscr):
-    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS
+    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS
     curses.echo()
     stdscr.nodelay(False)
     stdscr.timeout(-1)
@@ -418,18 +490,28 @@ def settings_screen(stdscr):
         0,
         "Show in-post links? enter y/n.",
     )
+    safe_addstr(
+        stdscr,
+        3,
+        0,
+        "Stock symbols format: TSLA.US, AAPL.US, MSFT.US",
+    )
 
     current_query = X_SEARCH_QUERY
     current_schedule = ", ".join(NEWS_SCHEDULE)
     current_links = "y" if SHOW_LINKS else "n"
+    current_symbols = ", ".join(STOCK_SYMBOLS)
 
-    new_query = prompt_input(stdscr, 4, "X search query", current_query, width)
+    new_query = prompt_input(stdscr, 5, "X search query", current_query, width)
     new_schedule_input = prompt_input(
-        stdscr, 5, "News schedule", current_schedule, width
+        stdscr, 6, "News schedule", current_schedule, width
     )
     new_links_input = prompt_input(
-        stdscr, 6, "Show links", current_links, width
+        stdscr, 7, "Show links", current_links, width
     ).lower()
+    new_symbols_input = prompt_input(
+        stdscr, 8, "Stock symbols", current_symbols, width
+    )
     new_schedule = parse_schedule(new_schedule_input)
     if not new_schedule:
         new_schedule = NEWS_SCHEDULE
@@ -439,10 +521,15 @@ def settings_screen(stdscr):
     elif new_links_input in ("n", "no", "false", "0"):
         show_links = False
 
-    save_settings(new_query, new_schedule, show_links)
+    symbols = [s.strip().upper() for s in new_symbols_input.split(",") if s.strip()]
+    if not symbols:
+        symbols = STOCK_SYMBOLS
+
+    save_settings(new_query, new_schedule, show_links, symbols)
     X_SEARCH_QUERY = new_query
     NEWS_SCHEDULE = new_schedule
     SHOW_LINKS = show_links
+    STOCK_SYMBOLS = symbols
 
     stdscr.erase()
     safe_addstr(stdscr, 0, 0, "Settings saved. Press any key to return.")
@@ -496,12 +583,55 @@ def draw(stdscr, weather, news, now):
             f"Wind {w['wind'] if w['wind'] is not None else 'N/A'} km/h {fmt_wind_dir(w['wind_dir'])}",
         )
 
+    stocks = get_stocks()
+    if curses.has_colors():
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+    safe_addstr(stdscr, 7, 0, "Stocks")
+    if curses.has_colors():
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+    stock_y = 8
+    if stocks.get("error"):
+        if curses.has_colors():
+            stdscr.attron(curses.color_pair(5))
+        safe_addstr(stdscr, stock_y, 0, f"  Error: {stocks['error']}"[: width - 1])
+        if curses.has_colors():
+            stdscr.attroff(curses.color_pair(5))
+        stock_y += 1
+    else:
+        for item in stocks.get("items", [])[:5]:
+            if stock_y >= height - 1:
+                break
+            symbol = item.get("symbol", "")
+            open_p = to_float(item.get("open"))
+            high_p = to_float(item.get("high"))
+            low_p = to_float(item.get("low"))
+            close_p = to_float(item.get("close"))
+            change = None
+            pct = None
+            arrow = "•"
+            if open_p is not None and close_p is not None:
+                change = close_p - open_p
+                if open_p != 0:
+                    pct = change / open_p * 100.0
+                if change > 0:
+                    arrow = "▲"
+                elif change < 0:
+                    arrow = "▼"
+            line = (
+                f"  {symbol:<8} {arrow} {fmt_num(close_p)} "
+                f"{fmt_num(change)} ({fmt_num(pct, 1)}%) "
+                f"R {fmt_num(low_p)}-{fmt_num(high_p)} "
+                f"V {fmt_volume(item.get('volume'))}"
+            )
+            safe_addstr(stdscr, stock_y, 0, line[: width - 1])
+            stock_y += 1
+
     schedule_text = ", ".join(NEWS_SCHEDULE) if NEWS_SCHEDULE else "manual"
     if curses.has_colors():
         stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
     safe_addstr(
         stdscr,
-        7,
+        stock_y + 1,
         0,
         f"News - X search: {X_SEARCH_QUERY} (schedule {schedule_text})"[: width - 1],
     )
@@ -511,15 +641,15 @@ def draw(stdscr, weather, news, now):
     if n["error"]:
         if curses.has_colors():
             stdscr.attron(curses.color_pair(5))
-        safe_addstr(stdscr, 8, 0, f"  Error: {n['error']}"[: width - 1])
+        safe_addstr(stdscr, stock_y + 2, 0, f"  Error: {n['error']}"[: width - 1])
         if n.get("raw"):
-            safe_addstr(stdscr, 9, 0, f"  Raw: {n['raw']}"[: width - 1])
+            safe_addstr(stdscr, stock_y + 3, 0, f"  Raw: {n['raw']}"[: width - 1])
         if curses.has_colors():
             stdscr.attroff(curses.color_pair(5))
     elif not n["items"]:
-        safe_addstr(stdscr, 8, 0, "  No results")
+        safe_addstr(stdscr, stock_y + 2, 0, "  No results")
     else:
-        y = 8
+        y = stock_y + 2
         for item in n["items"]:
             if y >= height - 1:
                 break

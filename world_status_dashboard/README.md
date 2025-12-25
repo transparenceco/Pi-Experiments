@@ -21,6 +21,29 @@ Or run the launcher (creates/uses a venv and installs deps):
 ./run.sh
 ```
 
+## Launcher Command
+
+You can create a global launcher so you can run `worldstatus` from anywhere:
+
+```bash
+mkdir -p ~/bin
+cat <<'SH' > ~/bin/worldstatus
+#!/usr/bin/env bash
+set -euo pipefail
+exec ~/Documents/Pi-Experiments/world_status_dashboard/run.sh
+SH
+chmod +x ~/bin/worldstatus
+```
+
+If `worldstatus` is not found on the Pi’s local terminal, add `~/bin` to PATH:
+
+```bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.profile
+source ~/.bashrc
+hash -r
+```
+
 On first launch you will be prompted for your xAI API key, which is saved to `config.json`.
 You can also provide it via `XAI_API_KEY` to skip onboarding.
 
@@ -41,6 +64,7 @@ Press `q` to quit. Press `s` for settings, `r` to refresh news.
 - News uses xAI agentic X search tools and caches results in `.cache/`.
 - Location is set to Toronto (lat/lon) and timezone `America/Toronto`.
 - Settings lets you toggle whether in-post links are shown.
+- Stocks are fetched from Stooq (free, no key) using symbols like `TSLA.US`.
 
 ## Feed Structure
 
@@ -67,3 +91,4 @@ News fetch uses xAI agentic tool calling:
 - Add per-topic query presets (Toronto, Canada, Tech) via settings.
 - Post-process results: de-duplicate similar headlines and remove spammy posts.
 - Add relevance boosting by requiring keywords (e.g., "Toronto" AND "weather").
+- Add change/% change for stocks and basic price alerts.
