@@ -26,6 +26,7 @@ DEFAULT_QUERY = "Toronto news OR Canada news"
 DEFAULT_NEWS_SCHEDULE = ["06:00", "12:00", "20:00"]
 DEFAULT_SHOW_LINKS = True
 DEFAULT_STOCK_SYMBOLS = ["TSLA.US"]
+DEFAULT_LOOKBACK_HOURS = ""
 
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "").strip()
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4-1-fast").strip()
@@ -39,6 +40,11 @@ X_SEARCH_QUERY = ""
 NEWS_SCHEDULE = []
 SHOW_LINKS = True
 STOCK_SYMBOLS = []
+ALLOWED_HANDLES = []
+EXCLUDED_HANDLES = []
+KEYWORDS_INCLUDE = []
+KEYWORDS_EXCLUDE = []
+NEWS_LOOKBACK_HOURS = ""
 
 
 WEATHER_CODES = {
@@ -156,8 +162,19 @@ def parse_schedule(value):
     return parsed
 
 
+def parse_csv_list(value):
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = [s.strip() for s in value.split(",") if s.strip()]
+    else:
+        items = []
+    return [item for item in items if item]
+
+
 def load_settings():
     global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS, X_MAX_RESULTS, SUMMARY_PROMPT
+    global ALLOWED_HANDLES, EXCLUDED_HANDLES, KEYWORDS_INCLUDE, KEYWORDS_EXCLUDE, NEWS_LOOKBACK_HOURS
     config = load_config()
     env_query = os.environ.get("X_SEARCH_QUERY", "").strip()
     X_SEARCH_QUERY = env_query or str(config.get("x_search_query", "")).strip() or DEFAULT_QUERY
@@ -169,6 +186,11 @@ def load_settings():
     if isinstance(symbols, str):
         symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     STOCK_SYMBOLS = [s.strip().upper() for s in symbols] or DEFAULT_STOCK_SYMBOLS
+    ALLOWED_HANDLES = parse_csv_list(config.get("allowed_handles", []))
+    EXCLUDED_HANDLES = parse_csv_list(config.get("excluded_handles", []))
+    KEYWORDS_INCLUDE = parse_csv_list(config.get("keywords_include", []))
+    KEYWORDS_EXCLUDE = parse_csv_list(config.get("keywords_exclude", []))
+    NEWS_LOOKBACK_HOURS = str(config.get("news_lookback_hours", DEFAULT_LOOKBACK_HOURS)).strip()
     max_results = config.get("x_max_results")
     if max_results is not None:
         try:
@@ -180,7 +202,19 @@ def load_settings():
         SUMMARY_PROMPT = prompt
 
 
-def save_settings(query, schedule, show_links, symbols, max_results, summary_prompt):
+def save_settings(
+    query,
+    schedule,
+    show_links,
+    symbols,
+    max_results,
+    summary_prompt,
+    allowed_handles,
+    excluded_handles,
+    keywords_include,
+    keywords_exclude,
+    lookback_hours,
+):
     config = load_config()
     config["x_search_query"] = query
     config["news_schedule"] = schedule
@@ -188,6 +222,11 @@ def save_settings(query, schedule, show_links, symbols, max_results, summary_pro
     config["stock_symbols"] = symbols
     config["x_max_results"] = max_results
     config["summary_prompt"] = summary_prompt
+    config["allowed_handles"] = allowed_handles
+    config["excluded_handles"] = excluded_handles
+    config["keywords_include"] = keywords_include
+    config["keywords_exclude"] = keywords_exclude
+    config["news_lookback_hours"] = lookback_hours
     save_config(config)
 
 
@@ -267,6 +306,13 @@ def get_stocks():
     return data
 
 
+def refresh_stocks_cache():
+    try:
+        os.remove(cache_path("stocks.json"))
+    except FileNotFoundError:
+        pass
+
+
 def schedule_due(now, last_fetch_dt):
     if not NEWS_SCHEDULE:
         return True
@@ -306,16 +352,30 @@ def get_news(now, force=False):
     except Exception:
         return {"error": "Missing dependency: xai-sdk (pip install xai-sdk==1.3.1)"}
 
+    include_terms = " ".join(KEYWORDS_INCLUDE)
+    exclude_terms = " ".join(f"-{term}" for term in KEYWORDS_EXCLUDE)
+    query = " ".join(part for part in [X_SEARCH_QUERY, include_terms, exclude_terms] if part).strip()
     prompt = (
         "Search X for recent posts about: "
-        f"{X_SEARCH_QUERY}. Return a JSON array with up to {X_MAX_RESULTS} items. "
+        f"{query}. Return a JSON array with up to {X_MAX_RESULTS} items. "
         "Each item must include: text, author_handle, created_at, url. "
         "If a field is unknown, use an empty string. Return only JSON."
     )
 
     try:
         client = Client(api_key=XAI_API_KEY)
-        chat = client.chat.create(model=XAI_MODEL, tools=[x_search()])
+        tool_args = {}
+        if ALLOWED_HANDLES and not EXCLUDED_HANDLES:
+            tool_args["allowed_x_handles"] = ALLOWED_HANDLES
+        if EXCLUDED_HANDLES and not ALLOWED_HANDLES:
+            tool_args["excluded_x_handles"] = EXCLUDED_HANDLES
+        if NEWS_LOOKBACK_HOURS:
+            try:
+                hours = float(NEWS_LOOKBACK_HOURS)
+                tool_args["from_date"] = now - dt.timedelta(hours=hours)
+            except (TypeError, ValueError):
+                pass
+        chat = client.chat.create(model=XAI_MODEL, tools=[x_search(**tool_args)])
         chat.append(user(prompt))
         response = chat.sample()
         content = response.content or ""
@@ -468,6 +528,8 @@ def init_colors():
     curses.init_pair(4, curses.COLOR_MAGENTA, -1) # meta
     curses.init_pair(5, curses.COLOR_RED, -1)     # errors
     curses.init_pair(6, curses.COLOR_BLUE, -1)    # links
+    curses.init_pair(7, curses.COLOR_GREEN, -1)   # up
+    curses.init_pair(8, curses.COLOR_RED, -1)     # down
 
 
 def osc8_link(url, label):
@@ -506,13 +568,14 @@ def prompt_input(stdscr, y, prompt, current, width):
 
 def settings_screen(stdscr):
     global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS, X_MAX_RESULTS, SUMMARY_PROMPT
+    global ALLOWED_HANDLES, EXCLUDED_HANDLES, KEYWORDS_INCLUDE, KEYWORDS_EXCLUDE, NEWS_LOOKBACK_HOURS
     curses.echo()
     stdscr.nodelay(False)
     stdscr.timeout(-1)
 
     height, width = stdscr.getmaxyx()
     stdscr.erase()
-    safe_addstr(stdscr, 0, 0, "Settings (leave blank to keep current)")
+    safe_addstr(stdscr, 0, 0, "Settings (leave blank to keep current, Enter to save)")
     safe_addstr(
         stdscr,
         1,
@@ -537,6 +600,12 @@ def settings_screen(stdscr):
         0,
         "Max results is a number; summary prompt is free text.",
     )
+    safe_addstr(
+        stdscr,
+        5,
+        0,
+        "Filters: handles and keywords are comma-separated lists.",
+    )
 
     current_query = X_SEARCH_QUERY
     current_schedule = ", ".join(NEWS_SCHEDULE)
@@ -544,22 +613,42 @@ def settings_screen(stdscr):
     current_symbols = ", ".join(STOCK_SYMBOLS)
     current_max_results = str(X_MAX_RESULTS)
     current_summary = SUMMARY_PROMPT
+    current_allowed = ", ".join(ALLOWED_HANDLES)
+    current_excluded = ", ".join(EXCLUDED_HANDLES)
+    current_keywords_include = ", ".join(KEYWORDS_INCLUDE)
+    current_keywords_exclude = ", ".join(KEYWORDS_EXCLUDE)
+    current_lookback = str(NEWS_LOOKBACK_HOURS)
 
-    new_query = prompt_input(stdscr, 6, "X search query", current_query, width)
+    new_query = prompt_input(stdscr, 7, "X search query", current_query, width)
     new_schedule_input = prompt_input(
-        stdscr, 7, "News schedule", current_schedule, width
+        stdscr, 8, "News schedule", current_schedule, width
     )
     new_links_input = prompt_input(
-        stdscr, 8, "Show links", current_links, width
+        stdscr, 9, "Show links", current_links, width
     ).lower()
     new_symbols_input = prompt_input(
-        stdscr, 9, "Stock symbols", current_symbols, width
+        stdscr, 10, "Stock symbols", current_symbols, width
     )
     new_max_results = prompt_input(
-        stdscr, 10, "Max results", current_max_results, width
+        stdscr, 11, "Max results", current_max_results, width
     )
     new_summary_prompt = prompt_input(
-        stdscr, 11, "Summary prompt", current_summary, width
+        stdscr, 12, "Summary prompt", current_summary, width
+    )
+    new_allowed = prompt_input(
+        stdscr, 13, "Allowed handles", current_allowed, width
+    )
+    new_excluded = prompt_input(
+        stdscr, 14, "Excluded handles", current_excluded, width
+    )
+    new_keywords_include = prompt_input(
+        stdscr, 15, "Include keywords", current_keywords_include, width
+    )
+    new_keywords_exclude = prompt_input(
+        stdscr, 16, "Exclude keywords", current_keywords_exclude, width
+    )
+    new_lookback = prompt_input(
+        stdscr, 17, "Lookback hours", current_lookback, width
     )
     new_schedule = parse_schedule(new_schedule_input)
     if not new_schedule:
@@ -581,13 +670,35 @@ def settings_screen(stdscr):
     if not new_summary_prompt.strip():
         new_summary_prompt = SUMMARY_PROMPT
 
-    save_settings(new_query, new_schedule, show_links, symbols, max_results, new_summary_prompt)
+    allowed_handles = parse_csv_list(new_allowed)
+    excluded_handles = parse_csv_list(new_excluded)
+    keywords_include = parse_csv_list(new_keywords_include)
+    keywords_exclude = parse_csv_list(new_keywords_exclude)
+
+    save_settings(
+        new_query,
+        new_schedule,
+        show_links,
+        symbols,
+        max_results,
+        new_summary_prompt,
+        allowed_handles,
+        excluded_handles,
+        keywords_include,
+        keywords_exclude,
+        new_lookback.strip(),
+    )
     X_SEARCH_QUERY = new_query
     NEWS_SCHEDULE = new_schedule
     SHOW_LINKS = show_links
     STOCK_SYMBOLS = symbols
     X_MAX_RESULTS = max_results
     SUMMARY_PROMPT = new_summary_prompt
+    ALLOWED_HANDLES = allowed_handles
+    EXCLUDED_HANDLES = excluded_handles
+    KEYWORDS_INCLUDE = keywords_include
+    KEYWORDS_EXCLUDE = keywords_exclude
+    NEWS_LOOKBACK_HOURS = new_lookback.strip()
 
     stdscr.erase()
     safe_addstr(stdscr, 0, 0, "Settings saved. Press any key to return.")
@@ -598,7 +709,7 @@ def settings_screen(stdscr):
     stdscr.timeout(0)
 
 
-def draw(stdscr, weather, news, now):
+def draw(stdscr, weather, news, now, status=""):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
@@ -667,21 +778,28 @@ def draw(stdscr, weather, news, now):
             change = None
             pct = None
             arrow = "•"
+            color = None
             if open_p is not None and close_p is not None:
                 change = close_p - open_p
                 if open_p != 0:
                     pct = change / open_p * 100.0
                 if change > 0:
                     arrow = "▲"
+                    color = 7
                 elif change < 0:
                     arrow = "▼"
+                    color = 8
             line = (
                 f"  {symbol:<8} {arrow} {fmt_num(close_p)} "
                 f"{fmt_num(change)} ({fmt_num(pct, 1)}%) "
                 f"R {fmt_num(low_p)}-{fmt_num(high_p)} "
                 f"V {fmt_volume(item.get('volume'))}"
             )
+            if color and curses.has_colors():
+                stdscr.attron(curses.color_pair(color))
             safe_addstr(stdscr, stock_y, 0, line[: width - 1])
+            if color and curses.has_colors():
+                stdscr.attroff(curses.color_pair(color))
             stock_y += 1
 
     schedule_text = ", ".join(NEWS_SCHEDULE) if NEWS_SCHEDULE else "manual"
@@ -755,7 +873,10 @@ def draw(stdscr, weather, news, now):
                 break
             y += 1
 
-    safe_addstr(stdscr, height - 1, 0, "Press q to quit | s settings | r refresh")
+    footer = "Press q to quit | s settings | r refresh"
+    if status:
+        footer = f"{footer} | {status}"
+    safe_addstr(stdscr, height - 1, 0, footer[: width - 1])
     stdscr.refresh()
 
 
@@ -769,6 +890,7 @@ def dashboard(stdscr):
     news = {}
     last_weather_fetch = 0.0
 
+    status = ""
     while True:
         now = dt.datetime.now(ZoneInfo(TIMEZONE))
         now_ts = time.time()
@@ -785,7 +907,8 @@ def dashboard(stdscr):
         except Exception as exc:
             news = {"error": str(exc)}
 
-        draw(stdscr, weather, news, now)
+        draw(stdscr, weather, news, now, status)
+        status = ""
 
         try:
             key = stdscr.getkey()
@@ -794,7 +917,10 @@ def dashboard(stdscr):
         if key in ("q", "Q"):
             break
         if key in ("r", "R"):
+            status = "Refreshing..."
+            draw(stdscr, weather, news, now, status)
             try:
+                refresh_stocks_cache()
                 news = get_news(now, force=True)
             except Exception as exc:
                 news = {"error": str(exc)}

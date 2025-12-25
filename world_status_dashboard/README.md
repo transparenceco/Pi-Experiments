@@ -77,6 +77,7 @@ Press `q` to quit. Press `s` for settings, `r` to refresh news.
 - Settings lets you toggle whether in-post links are shown.
 - Stocks are fetched from Stooq (free, no key) using symbols like `TSLA.US`.
 - Settings includes max results and the summary prompt for news.
+- Settings includes filters: allowed/excluded handles, include/exclude keywords, and lookback hours.
 
 ## Feed Structure
 
