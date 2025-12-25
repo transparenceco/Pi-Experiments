@@ -27,6 +27,63 @@ DEFAULT_NEWS_SCHEDULE = ["06:00", "12:00", "20:00"]
 DEFAULT_SHOW_LINKS = True
 DEFAULT_STOCK_SYMBOLS = ["TSLA.US"]
 DEFAULT_LOOKBACK_HOURS = ""
+DEFAULT_ALLOWED_HANDLE_LIMIT = 10
+DEFAULT_SHOW_POSTS = True
+HANDLE_PRESETS = {
+    "world": [
+        "BBCWorld",
+        "Reuters",
+        "AP",
+        "AlJazeera",
+        "CNN",
+        "NBCNews",
+        "CBSNews",
+        "ABC",
+        "SkyNews",
+        "FT",
+        "WSJ",
+        "TheEconomist",
+        "guardian",
+        "nytimes",
+        "washingtonpost",
+    ],
+    "mexico": [
+        "El_Universal_Mx",
+        "Milenio",
+        "reforma",
+        "Proceso",
+        "AnimalPolitico",
+        "AristeguiOnline",
+        "eleconomista",
+        "ExpPolitica",
+        "lopezdoriga",
+        "aztecanoticias",
+    ],
+    "canada": [
+        "CBCNews",
+        "CTVNews",
+        "GlobalNews",
+        "CityNews",
+        "nationalpost",
+        "GlobeAndMail",
+        "TorontoStar",
+        "Macleans",
+        "CP24",
+        "TheHillTimes",
+        "iPoliticsCA",
+    ],
+    "toronto": [
+        "CTVToronto",
+        "CP24",
+        "CityNewsTO",
+        "TorontoStar",
+        "blogTO",
+        "ttcnewsroom",
+        "TorontoPolice",
+        "torontohealth",
+        "TOnews",
+    ],
+}
 
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "").strip()
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4-1-fast").strip()
@@ -45,6 +102,8 @@ EXCLUDED_HANDLES = []
 KEYWORDS_INCLUDE = []
 KEYWORDS_EXCLUDE = []
 NEWS_LOOKBACK_HOURS = ""
+ALLOWED_HANDLE_LIMIT = DEFAULT_ALLOWED_HANDLE_LIMIT
+SHOW_POSTS = DEFAULT_SHOW_POSTS
 
 
 WEATHER_CODES = {
@@ -175,6 +234,7 @@ def parse_csv_list(value):
 def load_settings():
     global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS, X_MAX_RESULTS, SUMMARY_PROMPT
     global ALLOWED_HANDLES, EXCLUDED_HANDLES, KEYWORDS_INCLUDE, KEYWORDS_EXCLUDE, NEWS_LOOKBACK_HOURS
+    global ALLOWED_HANDLE_LIMIT, SHOW_POSTS
     config = load_config()
     env_query = os.environ.get("X_SEARCH_QUERY", "").strip()
     X_SEARCH_QUERY = env_query or str(config.get("x_search_query", "")).strip() or DEFAULT_QUERY
@@ -191,6 +251,13 @@ def load_settings():
     KEYWORDS_INCLUDE = parse_csv_list(config.get("keywords_include", []))
     KEYWORDS_EXCLUDE = parse_csv_list(config.get("keywords_exclude", []))
     NEWS_LOOKBACK_HOURS = str(config.get("news_lookback_hours", DEFAULT_LOOKBACK_HOURS)).strip()
+    limit = config.get("allowed_handle_limit", DEFAULT_ALLOWED_HANDLE_LIMIT)
+    try:
+        ALLOWED_HANDLE_LIMIT = max(1, min(10, int(limit)))
+    except (TypeError, ValueError):
+        ALLOWED_HANDLE_LIMIT = DEFAULT_ALLOWED_HANDLE_LIMIT
+    show_posts = config.get("show_posts", DEFAULT_SHOW_POSTS)
+    SHOW_POSTS = bool(show_posts)
     max_results = config.get("x_max_results")
     if max_results is not None:
         try:
@@ -214,6 +281,8 @@ def save_settings(
     keywords_include,
     keywords_exclude,
     lookback_hours,
+    allowed_handle_limit,
+    show_posts,
 ):
     config = load_config()
     config["x_search_query"] = query
@@ -227,6 +296,8 @@ def save_settings(
     config["keywords_include"] = keywords_include
     config["keywords_exclude"] = keywords_exclude
     config["news_lookback_hours"] = lookback_hours
+    config["allowed_handle_limit"] = allowed_handle_limit
+    config["show_posts"] = bool(show_posts)
     save_config(config)
 
 
@@ -277,30 +348,35 @@ def get_stocks():
     symbols = [s.lower() for s in STOCK_SYMBOLS]
     if not symbols:
         return {"items": []}
-    url = "https://stooq.com/q/l/?s=" + ",".join(symbols) + "&f=sd2t2ohlcv&h&e=csv"
-    try:
-        with urllib.request.urlopen(url, timeout=6) as resp:
-            body = resp.read().decode("utf-8")
-    except Exception as exc:
-        return {"error": str(exc)}
-
     items = []
-    reader = csv.DictReader(body.splitlines())
-    for row in reader:
-        if not row:
+    for symbol in symbols:
+        url = "https://stooq.com/q/l/?s=" + symbol + "&f=sd2t2ohlcv&h&e=csv"
+        try:
+            with urllib.request.urlopen(url, timeout=6) as resp:
+                body = resp.read().decode("utf-8")
+        except Exception as exc:
+            return {"error": str(exc)}
+
+        rows = body.splitlines()
+        if len(rows) < 2:
             continue
-        items.append(
-            {
-                "symbol": row.get("Symbol", ""),
-                "date": row.get("Date", ""),
-                "time": row.get("Time", ""),
-                "open": row.get("Open", ""),
-                "high": row.get("High", ""),
-                "low": row.get("Low", ""),
-                "close": row.get("Close", ""),
-                "volume": row.get("Volume", ""),
-            }
-        )
+        reader = csv.DictReader(rows)
+        for row in reader:
+            if not row:
+                continue
+            items.append(
+                {
+                    "symbol": row.get("Symbol", ""),
+                    "date": row.get("Date", ""),
+                    "time": row.get("Time", ""),
+                    "open": row.get("Open", ""),
+                    "high": row.get("High", ""),
+                    "low": row.get("Low", ""),
+                    "close": row.get("Close", ""),
+                    "volume": row.get("Volume", ""),
+                }
+            )
+            break
     data = {"items": items}
     write_cache("stocks.json", data)
     return data
@@ -309,6 +385,13 @@ def get_stocks():
 def refresh_stocks_cache():
     try:
         os.remove(cache_path("stocks.json"))
+    except FileNotFoundError:
+        pass
+
+
+def refresh_news_cache():
+    try:
+        os.remove(cache_path("news.json"))
     except FileNotFoundError:
         pass
 
@@ -365,14 +448,27 @@ def get_news(now, force=False):
     try:
         client = Client(api_key=XAI_API_KEY)
         tool_args = {}
+        warnings = []
         if ALLOWED_HANDLES and not EXCLUDED_HANDLES:
-            tool_args["allowed_x_handles"] = ALLOWED_HANDLES
+            handles = ALLOWED_HANDLES[:]
+            if len(handles) > ALLOWED_HANDLE_LIMIT:
+                offset = now.toordinal() % len(handles)
+                handles = handles[offset:] + handles[:offset]
+                warnings.append(f"Allowed handles rotated (offset {offset})")
+            handles = handles[:ALLOWED_HANDLE_LIMIT]
+            if len(ALLOWED_HANDLES) > ALLOWED_HANDLE_LIMIT:
+                warnings.append(f"Allowed handles trimmed to {ALLOWED_HANDLE_LIMIT}")
+            tool_args["allowed_x_handles"] = handles
         if EXCLUDED_HANDLES and not ALLOWED_HANDLES:
-            tool_args["excluded_x_handles"] = EXCLUDED_HANDLES
+            handles = EXCLUDED_HANDLES[:ALLOWED_HANDLE_LIMIT]
+            if len(EXCLUDED_HANDLES) > ALLOWED_HANDLE_LIMIT:
+                warnings.append(f"Excluded handles trimmed to {ALLOWED_HANDLE_LIMIT}")
+            tool_args["excluded_x_handles"] = handles
         if NEWS_LOOKBACK_HOURS:
             try:
                 hours = float(NEWS_LOOKBACK_HOURS)
-                tool_args["from_date"] = now - dt.timedelta(hours=hours)
+                from_dt = dt.datetime.utcnow() - dt.timedelta(hours=hours)
+                tool_args["from_date"] = from_dt
             except (TypeError, ValueError):
                 pass
         chat = client.chat.create(model=XAI_MODEL, tools=[x_search(**tool_args)])
@@ -387,7 +483,25 @@ def get_news(now, force=False):
     except json.JSONDecodeError:
         return {"error": "Invalid response from xAI search", "raw": content}
 
+    if ALLOWED_HANDLES:
+        allowed = {h.lstrip("@").lower() for h in ALLOWED_HANDLES}
+        filtered = []
+        for item in items:
+            handle = str(item.get("author_handle", "")).lstrip("@").lower()
+            if handle in allowed:
+                filtered.append(item)
+        items = filtered
+    elif EXCLUDED_HANDLES:
+        excluded = {h.lstrip("@").lower() for h in EXCLUDED_HANDLES}
+        filtered = []
+        for item in items:
+            handle = str(item.get("author_handle", "")).lstrip("@").lower()
+            if handle and handle not in excluded:
+                filtered.append(item)
+        items = filtered
+
     summary = ""
+    summary_error = ""
     if items:
         try:
             summary_prompt = (
@@ -399,10 +513,18 @@ def get_news(now, force=False):
             sum_chat.append(user(summary_prompt))
             sum_resp = sum_chat.sample()
             summary = (sum_resp.content or "").strip()
-        except Exception:
+        except Exception as exc:
             summary = ""
+            summary_error = str(exc)
 
-    data = {"items": items, "summary": summary, "fetched_at": now.isoformat()}
+    data = {
+        "items": items,
+        "summary": summary,
+        "fetched_at": now.isoformat(),
+        "total_items": len(items),
+        "summary_error": summary_error,
+        "warnings": warnings,
+    }
     write_cache("news.json", data)
     return data
 
@@ -459,6 +581,10 @@ def parse_news(data):
         "items": items,
         "raw": "",
         "summary": str(data.get("summary", "")).strip(),
+        "fetched_at": str(data.get("fetched_at", "")).strip(),
+        "total_items": data.get("total_items", len(items)),
+        "summary_error": str(data.get("summary_error", "")).strip(),
+        "warnings": data.get("warnings", []),
     }
 
 
@@ -482,6 +608,16 @@ def fmt_time(ts):
         return t.astimezone(ZoneInfo(TIMEZONE)).strftime("%H:%M")
     except ValueError:
         return ts
+
+
+def fmt_iso_datetime(value):
+    if not value:
+        return ""
+    try:
+        t = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return t.astimezone(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return value
 
 
 def to_float(value):
@@ -530,6 +666,7 @@ def init_colors():
     curses.init_pair(6, curses.COLOR_BLUE, -1)    # links
     curses.init_pair(7, curses.COLOR_GREEN, -1)   # up
     curses.init_pair(8, curses.COLOR_RED, -1)     # down
+    curses.init_pair(9, curses.COLOR_WHITE, -1)   # footer
 
 
 def osc8_link(url, label):
@@ -543,13 +680,12 @@ def osc8_link(url, label):
 def wrap_line(prefix, text, width):
     if width <= 0:
         return []
-    first_width = max(1, width)
-    lines = textwrap.wrap(text, width=first_width) if text else [""]
+    avail = max(1, width - len(prefix))
+    lines = textwrap.wrap(text, width=avail) if text else [""]
     if not lines:
         lines = [""]
     wrapped = []
-    first = lines[0]
-    wrapped.append(f"{prefix}{first}"[:width])
+    wrapped.append(f"{prefix}{lines[0]}"[:width])
     indent = " " * len(prefix)
     for line in lines[1:]:
         wrapped.append(f"{indent}{line}"[:width])
@@ -569,6 +705,7 @@ def prompt_input(stdscr, y, prompt, current, width):
 def settings_screen(stdscr):
     global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS, X_MAX_RESULTS, SUMMARY_PROMPT
     global ALLOWED_HANDLES, EXCLUDED_HANDLES, KEYWORDS_INCLUDE, KEYWORDS_EXCLUDE, NEWS_LOOKBACK_HOURS
+    global ALLOWED_HANDLE_LIMIT, SHOW_POSTS
     curses.echo()
     stdscr.nodelay(False)
     stdscr.timeout(-1)
@@ -606,6 +743,30 @@ def settings_screen(stdscr):
         0,
         "Filters: handles and keywords are comma-separated lists.",
     )
+    safe_addstr(
+        stdscr,
+        6,
+        0,
+        "Allowed handles can be a preset: world, mexico, canada, toronto, all.",
+    )
+    safe_addstr(
+        stdscr,
+        7,
+        0,
+        "Allowed handle limit sets how many handles are passed to X (max 10).",
+    )
+    safe_addstr(
+        stdscr,
+        8,
+        0,
+        "Show posts toggles the list under the summary (y/n).",
+    )
+    safe_addstr(
+        stdscr,
+        9,
+        0,
+        "If handles exceed the limit, they rotate daily.",
+    )
 
     current_query = X_SEARCH_QUERY
     current_schedule = ", ".join(NEWS_SCHEDULE)
@@ -618,37 +779,45 @@ def settings_screen(stdscr):
     current_keywords_include = ", ".join(KEYWORDS_INCLUDE)
     current_keywords_exclude = ", ".join(KEYWORDS_EXCLUDE)
     current_lookback = str(NEWS_LOOKBACK_HOURS)
+    current_handle_limit = str(ALLOWED_HANDLE_LIMIT)
+    current_show_posts = "y" if SHOW_POSTS else "n"
 
-    new_query = prompt_input(stdscr, 7, "X search query", current_query, width)
+    new_query = prompt_input(stdscr, 11, "X search query", current_query, width)
     new_schedule_input = prompt_input(
-        stdscr, 8, "News schedule", current_schedule, width
+        stdscr, 12, "News schedule", current_schedule, width
     )
     new_links_input = prompt_input(
-        stdscr, 9, "Show links", current_links, width
+        stdscr, 13, "Show links", current_links, width
     ).lower()
     new_symbols_input = prompt_input(
-        stdscr, 10, "Stock symbols", current_symbols, width
+        stdscr, 14, "Stock symbols", current_symbols, width
     )
     new_max_results = prompt_input(
-        stdscr, 11, "Max results", current_max_results, width
+        stdscr, 15, "Max results", current_max_results, width
     )
     new_summary_prompt = prompt_input(
-        stdscr, 12, "Summary prompt", current_summary, width
+        stdscr, 16, "Summary prompt", current_summary, width
     )
     new_allowed = prompt_input(
-        stdscr, 13, "Allowed handles", current_allowed, width
+        stdscr, 17, "Allowed handles", current_allowed, width
     )
     new_excluded = prompt_input(
-        stdscr, 14, "Excluded handles", current_excluded, width
+        stdscr, 18, "Excluded handles", current_excluded, width
     )
     new_keywords_include = prompt_input(
-        stdscr, 15, "Include keywords", current_keywords_include, width
+        stdscr, 19, "Include keywords", current_keywords_include, width
     )
     new_keywords_exclude = prompt_input(
-        stdscr, 16, "Exclude keywords", current_keywords_exclude, width
+        stdscr, 20, "Exclude keywords", current_keywords_exclude, width
     )
     new_lookback = prompt_input(
-        stdscr, 17, "Lookback hours", current_lookback, width
+        stdscr, 21, "Lookback hours", current_lookback, width
+    )
+    new_handle_limit = prompt_input(
+        stdscr, 22, "Allowed handle limit", current_handle_limit, width
+    )
+    new_show_posts = prompt_input(
+        stdscr, 23, "Show posts", current_show_posts, width
     )
     new_schedule = parse_schedule(new_schedule_input)
     if not new_schedule:
@@ -670,10 +839,28 @@ def settings_screen(stdscr):
     if not new_summary_prompt.strip():
         new_summary_prompt = SUMMARY_PROMPT
 
-    allowed_handles = parse_csv_list(new_allowed)
+    allowed_input = new_allowed.strip().lower()
+    if allowed_input == "all":
+        allowed_handles = sorted(
+            {h for handles in HANDLE_PRESETS.values() for h in handles}
+        )
+    elif allowed_input in HANDLE_PRESETS:
+        allowed_handles = HANDLE_PRESETS[allowed_input][:]
+    else:
+        allowed_handles = parse_csv_list(new_allowed)
     excluded_handles = parse_csv_list(new_excluded)
     keywords_include = parse_csv_list(new_keywords_include)
     keywords_exclude = parse_csv_list(new_keywords_exclude)
+    show_posts = SHOW_POSTS
+    if new_show_posts in ("y", "yes", "true", "1"):
+        show_posts = True
+    elif new_show_posts in ("n", "no", "false", "0"):
+        show_posts = False
+
+    try:
+        allowed_handle_limit = max(1, min(10, int(new_handle_limit)))
+    except (TypeError, ValueError):
+        allowed_handle_limit = ALLOWED_HANDLE_LIMIT
 
     save_settings(
         new_query,
@@ -687,6 +874,8 @@ def settings_screen(stdscr):
         keywords_include,
         keywords_exclude,
         new_lookback.strip(),
+        allowed_handle_limit,
+        show_posts,
     )
     X_SEARCH_QUERY = new_query
     NEWS_SCHEDULE = new_schedule
@@ -699,6 +888,8 @@ def settings_screen(stdscr):
     KEYWORDS_INCLUDE = keywords_include
     KEYWORDS_EXCLUDE = keywords_exclude
     NEWS_LOOKBACK_HOURS = new_lookback.strip()
+    ALLOWED_HANDLE_LIMIT = allowed_handle_limit
+    SHOW_POSTS = show_posts
 
     stdscr.erase()
     safe_addstr(stdscr, 0, 0, "Settings saved. Press any key to return.")
@@ -814,20 +1005,30 @@ def draw(stdscr, weather, news, now, status=""):
     if curses.has_colors():
         stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
     n = parse_news(news)
+    if n.get("fetched_at"):
+        safe_addstr(
+            stdscr,
+            stock_y + 2,
+            0,
+            f"  Updated: {fmt_iso_datetime(n['fetched_at'])}"[: width - 1],
+        )
+        base_y = stock_y + 3
+    else:
+        base_y = stock_y + 2
     if n["error"]:
         if curses.has_colors():
             stdscr.attron(curses.color_pair(5))
-        safe_addstr(stdscr, stock_y + 2, 0, f"  Error: {n['error']}"[: width - 1])
+        safe_addstr(stdscr, base_y, 0, f"  Error: {n['error']}"[: width - 1])
         if n.get("raw"):
-            safe_addstr(stdscr, stock_y + 3, 0, f"  Raw: {n['raw']}"[: width - 1])
+            safe_addstr(stdscr, base_y + 1, 0, f"  Raw: {n['raw']}"[: width - 1])
         if curses.has_colors():
             stdscr.attroff(curses.color_pair(5))
     elif not n["items"]:
-        safe_addstr(stdscr, stock_y + 2, 0, "  No results")
+        safe_addstr(stdscr, base_y, 0, "  No results")
     else:
-        y = stock_y + 2
+        y = base_y
         if n.get("summary"):
-            summary_lines = wrap_line("  Summary: ", n["summary"], width - 1)
+            summary_lines = wrap_line("  ", n["summary"], width - 1)
             for line in summary_lines:
                 if y >= height - 1:
                     break
@@ -835,52 +1036,71 @@ def draw(stdscr, weather, news, now, status=""):
                 y += 1
             if y < height - 1:
                 y += 1
-        for item in n["items"]:
-            if y >= height - 1:
-                break
-            lines = wrap_line("  ", item["text"], width - 1)
-            for line in lines:
+        elif n.get("summary_error"):
+            safe_addstr(
+                stdscr,
+                y,
+                0,
+                f"  Summary error: {n['summary_error']}"[: width - 1],
+            )
+            y += 1
+        else:
+            safe_addstr(stdscr, y, 0, "  (summary not available)")
+            y += 1
+        if not SHOW_POSTS:
+            pass
+        else:
+            for item in n["items"]:
                 if y >= height - 1:
                     break
-                safe_addstr(stdscr, y, 0, line)
+                lines = wrap_line("  ", item["text"], width - 1)
+                for line in lines:
+                    if y >= height - 1:
+                        break
+                    safe_addstr(stdscr, y, 0, line)
+                    y += 1
+                if y >= height - 1:
+                    break
+                meta_label = f"@{item['user']} {fmt_time(item['time'])}"
+                meta = f"  {meta_label}"
+                if curses.has_colors():
+                    stdscr.attron(curses.color_pair(4))
+                safe_addstr(stdscr, y, 0, meta[: width - 1])
+                if curses.has_colors():
+                    stdscr.attroff(curses.color_pair(4))
                 y += 1
-            if y >= height - 1:
-                break
-            meta_label = f"@{item['user']} {fmt_time(item['time'])}"
-            meta = f"  {meta_label}"
-            if curses.has_colors():
-                stdscr.attron(curses.color_pair(4))
-            safe_addstr(stdscr, y, 0, meta[: width - 1])
-            if curses.has_colors():
-                stdscr.attroff(curses.color_pair(4))
-            y += 1
-            if y >= height - 1:
-                break
-            if SHOW_LINKS:
-                url = item.get("url", "")
-                if url:
-                    url_lines = wrap_line("  ", url, width - 1)
-                    for line in url_lines:
-                        if y >= height - 1:
-                            break
-                        if curses.has_colors():
-                            stdscr.attron(curses.color_pair(6))
-                        safe_addstr(stdscr, y, 0, line)
-                        if curses.has_colors():
-                            stdscr.attroff(curses.color_pair(6))
-                        y += 1
-            if y >= height - 1:
-                break
-            y += 1
+                if y >= height - 1:
+                    break
+                if SHOW_LINKS:
+                    url = item.get("url", "")
+                    if url:
+                        url_lines = wrap_line("  ", url, width - 1)
+                        for line in url_lines:
+                            if y >= height - 1:
+                                break
+                            if curses.has_colors():
+                                stdscr.attron(curses.color_pair(6))
+                            safe_addstr(stdscr, y, 0, line)
+                            if curses.has_colors():
+                                stdscr.attroff(curses.color_pair(6))
+                            y += 1
+                if y >= height - 1:
+                    break
+                y += 1
 
-    footer = "Press q to quit | s settings | r refresh"
+    footer = "Press q to quit | s settings | r refresh | h hide posts"
     if status:
         footer = f"{footer} | {status}"
+    if curses.has_colors():
+        stdscr.attron(curses.color_pair(9) | curses.A_DIM)
     safe_addstr(stdscr, height - 1, 0, footer[: width - 1])
+    if curses.has_colors():
+        stdscr.attroff(curses.color_pair(9) | curses.A_DIM)
     stdscr.refresh()
 
 
 def dashboard(stdscr):
+    global SHOW_POSTS
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(0)
@@ -906,6 +1126,7 @@ def dashboard(stdscr):
             news = get_news(now, force=False)
         except Exception as exc:
             news = {"error": str(exc)}
+            status = f"News error: {exc}"
 
         draw(stdscr, weather, news, now, status)
         status = ""
@@ -920,12 +1141,17 @@ def dashboard(stdscr):
             status = "Refreshing..."
             draw(stdscr, weather, news, now, status)
             try:
+                refresh_news_cache()
                 refresh_stocks_cache()
                 news = get_news(now, force=True)
+                status = "Refreshed"
             except Exception as exc:
                 news = {"error": str(exc)}
+                status = f"Refresh error: {exc}"
         if key in ("s", "S"):
             settings_screen(stdscr)
+        if key in ("h", "H"):
+            SHOW_POSTS = not SHOW_POSTS
 
         time.sleep(1)
 

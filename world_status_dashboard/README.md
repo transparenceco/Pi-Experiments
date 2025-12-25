@@ -78,6 +78,8 @@ Press `q` to quit. Press `s` for settings, `r` to refresh news.
 - Stocks are fetched from Stooq (free, no key) using symbols like `TSLA.US`.
 - Settings includes max results and the summary prompt for news.
 - Settings includes filters: allowed/excluded handles, include/exclude keywords, and lookback hours.
+- Allowed handles supports presets: `world`, `mexico`, `canada`, `toronto`, or `all`.
+- Settings includes “Allowed handle limit” (max 10) for X search tool constraints.
 
 ## Feed Structure
 
