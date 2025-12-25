@@ -76,6 +76,7 @@ Press `q` to quit. Press `s` for settings, `r` to refresh news.
 - Location is set to Toronto (lat/lon) and timezone `America/Toronto`.
 - Settings lets you toggle whether in-post links are shown.
 - Stocks are fetched from Stooq (free, no key) using symbols like `TSLA.US`.
+- Settings includes max results and the summary prompt for news.
 
 ## Feed Structure
 

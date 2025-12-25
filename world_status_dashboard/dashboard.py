@@ -30,6 +30,10 @@ DEFAULT_STOCK_SYMBOLS = ["TSLA.US"]
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "").strip()
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4-1-fast").strip()
 X_MAX_RESULTS = int(os.environ.get("X_MAX_RESULTS", "6"))
+SUMMARY_PROMPT = (
+    "Summarize the following X posts in 1-2 sentences. "
+    "Be concise and neutral."
+)
 
 X_SEARCH_QUERY = ""
 NEWS_SCHEDULE = []
@@ -153,7 +157,7 @@ def parse_schedule(value):
 
 
 def load_settings():
-    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS
+    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS, X_MAX_RESULTS, SUMMARY_PROMPT
     config = load_config()
     env_query = os.environ.get("X_SEARCH_QUERY", "").strip()
     X_SEARCH_QUERY = env_query or str(config.get("x_search_query", "")).strip() or DEFAULT_QUERY
@@ -165,14 +169,25 @@ def load_settings():
     if isinstance(symbols, str):
         symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     STOCK_SYMBOLS = [s.strip().upper() for s in symbols] or DEFAULT_STOCK_SYMBOLS
+    max_results = config.get("x_max_results")
+    if max_results is not None:
+        try:
+            X_MAX_RESULTS = max(1, int(max_results))
+        except (TypeError, ValueError):
+            pass
+    prompt = str(config.get("summary_prompt", "")).strip()
+    if prompt:
+        SUMMARY_PROMPT = prompt
 
 
-def save_settings(query, schedule, show_links, symbols):
+def save_settings(query, schedule, show_links, symbols, max_results, summary_prompt):
     config = load_config()
     config["x_search_query"] = query
     config["news_schedule"] = schedule
     config["show_links"] = bool(show_links)
     config["stock_symbols"] = symbols
+    config["x_max_results"] = max_results
+    config["summary_prompt"] = summary_prompt
     save_config(config)
 
 
@@ -312,7 +327,22 @@ def get_news(now, force=False):
     except json.JSONDecodeError:
         return {"error": "Invalid response from xAI search", "raw": content}
 
-    data = {"items": items, "fetched_at": now.isoformat()}
+    summary = ""
+    if items:
+        try:
+            summary_prompt = (
+                SUMMARY_PROMPT
+                + " Posts:\n"
+                + "\n".join(f"- {i.get('text','')}" for i in items)
+            )
+            sum_chat = client.chat.create(model=XAI_MODEL)
+            sum_chat.append(user(summary_prompt))
+            sum_resp = sum_chat.sample()
+            summary = (sum_resp.content or "").strip()
+        except Exception:
+            summary = ""
+
+    data = {"items": items, "summary": summary, "fetched_at": now.isoformat()}
     write_cache("news.json", data)
     return data
 
@@ -364,7 +394,12 @@ def parse_news(data):
                 "url": str(item.get("url", "")),
             }
         )
-    return {"error": None, "items": items, "raw": ""}
+    return {
+        "error": None,
+        "items": items,
+        "raw": "",
+        "summary": str(data.get("summary", "")).strip(),
+    }
 
 
 def fmt_temp(value):
@@ -470,7 +505,7 @@ def prompt_input(stdscr, y, prompt, current, width):
 
 
 def settings_screen(stdscr):
-    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS
+    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS, STOCK_SYMBOLS, X_MAX_RESULTS, SUMMARY_PROMPT
     curses.echo()
     stdscr.nodelay(False)
     stdscr.timeout(-1)
@@ -496,21 +531,35 @@ def settings_screen(stdscr):
         0,
         "Stock symbols format: TSLA.US, AAPL.US, MSFT.US",
     )
+    safe_addstr(
+        stdscr,
+        4,
+        0,
+        "Max results is a number; summary prompt is free text.",
+    )
 
     current_query = X_SEARCH_QUERY
     current_schedule = ", ".join(NEWS_SCHEDULE)
     current_links = "y" if SHOW_LINKS else "n"
     current_symbols = ", ".join(STOCK_SYMBOLS)
+    current_max_results = str(X_MAX_RESULTS)
+    current_summary = SUMMARY_PROMPT
 
-    new_query = prompt_input(stdscr, 5, "X search query", current_query, width)
+    new_query = prompt_input(stdscr, 6, "X search query", current_query, width)
     new_schedule_input = prompt_input(
-        stdscr, 6, "News schedule", current_schedule, width
+        stdscr, 7, "News schedule", current_schedule, width
     )
     new_links_input = prompt_input(
-        stdscr, 7, "Show links", current_links, width
+        stdscr, 8, "Show links", current_links, width
     ).lower()
     new_symbols_input = prompt_input(
-        stdscr, 8, "Stock symbols", current_symbols, width
+        stdscr, 9, "Stock symbols", current_symbols, width
+    )
+    new_max_results = prompt_input(
+        stdscr, 10, "Max results", current_max_results, width
+    )
+    new_summary_prompt = prompt_input(
+        stdscr, 11, "Summary prompt", current_summary, width
     )
     new_schedule = parse_schedule(new_schedule_input)
     if not new_schedule:
@@ -525,11 +574,20 @@ def settings_screen(stdscr):
     if not symbols:
         symbols = STOCK_SYMBOLS
 
-    save_settings(new_query, new_schedule, show_links, symbols)
+    try:
+        max_results = max(1, int(new_max_results))
+    except (TypeError, ValueError):
+        max_results = X_MAX_RESULTS
+    if not new_summary_prompt.strip():
+        new_summary_prompt = SUMMARY_PROMPT
+
+    save_settings(new_query, new_schedule, show_links, symbols, max_results, new_summary_prompt)
     X_SEARCH_QUERY = new_query
     NEWS_SCHEDULE = new_schedule
     SHOW_LINKS = show_links
     STOCK_SYMBOLS = symbols
+    X_MAX_RESULTS = max_results
+    SUMMARY_PROMPT = new_summary_prompt
 
     stdscr.erase()
     safe_addstr(stdscr, 0, 0, "Settings saved. Press any key to return.")
@@ -650,6 +708,15 @@ def draw(stdscr, weather, news, now):
         safe_addstr(stdscr, stock_y + 2, 0, "  No results")
     else:
         y = stock_y + 2
+        if n.get("summary"):
+            summary_lines = wrap_line("  Summary: ", n["summary"], width - 1)
+            for line in summary_lines:
+                if y >= height - 1:
+                    break
+                safe_addstr(stdscr, y, 0, line)
+                y += 1
+            if y < height - 1:
+                y += 1
         for item in n["items"]:
             if y >= height - 1:
                 break
