@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import time
+import textwrap
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -18,14 +19,18 @@ BASE_DIR = os.path.dirname(__file__)
 CACHE_DIR = os.path.join(BASE_DIR, ".cache")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 WEATHER_TTL_SECONDS = 1800
-NEWS_TTL_SECONDS = 1800
+
+DEFAULT_QUERY = "Toronto news OR Canada news"
+DEFAULT_NEWS_SCHEDULE = ["06:00", "12:00", "20:00"]
+DEFAULT_SHOW_LINKS = True
 
 XAI_API_KEY = os.environ.get("XAI_API_KEY", "").strip()
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4-1-fast").strip()
-X_SEARCH_QUERY = os.environ.get(
-    "X_SEARCH_QUERY", "Toronto news OR Canada news"
-).strip()
 X_MAX_RESULTS = int(os.environ.get("X_MAX_RESULTS", "6"))
+
+X_SEARCH_QUERY = ""
+NEWS_SCHEDULE = []
+SHOW_LINKS = True
 
 
 WEATHER_CODES = {
@@ -86,9 +91,10 @@ def read_cache(name, ttl_seconds):
         st = os.stat(path)
     except FileNotFoundError:
         return None
-    age = time.time() - st.st_mtime
-    if age > ttl_seconds:
-        return None
+    if ttl_seconds is not None:
+        age = time.time() - st.st_mtime
+        if age > ttl_seconds:
+            return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -117,6 +123,48 @@ def save_config(data):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, CONFIG_PATH)
+
+
+def parse_schedule(value):
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = [s.strip() for s in value.split(",") if s.strip()]
+    else:
+        items = []
+    parsed = []
+    for item in items:
+        parts = item.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except ValueError:
+            continue
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            continue
+        parsed.append(f"{hour:02d}:{minute:02d}")
+    return parsed
+
+
+def load_settings():
+    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS
+    config = load_config()
+    env_query = os.environ.get("X_SEARCH_QUERY", "").strip()
+    X_SEARCH_QUERY = env_query or str(config.get("x_search_query", "")).strip() or DEFAULT_QUERY
+    schedule = config.get("news_schedule", DEFAULT_NEWS_SCHEDULE)
+    NEWS_SCHEDULE = parse_schedule(schedule) or DEFAULT_NEWS_SCHEDULE
+    show_links = config.get("show_links", DEFAULT_SHOW_LINKS)
+    SHOW_LINKS = bool(show_links)
+
+
+def save_settings(query, schedule, show_links):
+    config = load_config()
+    config["x_search_query"] = query
+    config["news_schedule"] = schedule
+    config["show_links"] = bool(show_links)
+    save_config(config)
 
 
 def ensure_xai_api_key():
@@ -158,9 +206,33 @@ def get_weather():
     return data
 
 
-def get_news():
-    cached = read_cache("news.json", NEWS_TTL_SECONDS)
-    if cached:
+def schedule_due(now, last_fetch_dt):
+    if not NEWS_SCHEDULE:
+        return True
+    if last_fetch_dt and last_fetch_dt.tzinfo is None:
+        last_fetch_dt = last_fetch_dt.replace(tzinfo=now.tzinfo)
+    schedule_times = []
+    for item in NEWS_SCHEDULE:
+        hour, minute = [int(p) for p in item.split(":")]
+        schedule_times.append(now.replace(hour=hour, minute=minute, second=0, microsecond=0))
+    due_times = [t for t in schedule_times if now >= t]
+    if not due_times:
+        return False
+    latest_due = max(due_times)
+    if last_fetch_dt is None:
+        return True
+    return last_fetch_dt < latest_due
+
+
+def get_news(now, force=False):
+    cached = read_cache("news.json", None)
+    last_fetch_dt = None
+    if cached and cached.get("fetched_at"):
+        try:
+            last_fetch_dt = dt.datetime.fromisoformat(cached["fetched_at"])
+        except ValueError:
+            last_fetch_dt = None
+    if cached and not force and not schedule_due(now, last_fetch_dt):
         return cached
 
     if not XAI_API_KEY:
@@ -194,7 +266,7 @@ def get_news():
     except json.JSONDecodeError:
         return {"error": "Invalid response from xAI search", "raw": content}
 
-    data = {"items": items}
+    data = {"items": items, "fetched_at": now.isoformat()}
     write_cache("news.json", data)
     return data
 
@@ -278,18 +350,136 @@ def safe_addstr(stdscr, y, x, text):
         pass
 
 
+def init_colors():
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)    # title
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # weather
+    curses.init_pair(3, curses.COLOR_GREEN, -1)   # news
+    curses.init_pair(4, curses.COLOR_MAGENTA, -1) # meta
+    curses.init_pair(5, curses.COLOR_RED, -1)     # errors
+    curses.init_pair(6, curses.COLOR_BLUE, -1)    # links
+
+
+def osc8_link(url, label):
+    if not url:
+        return label
+    esc = "\x1b]8;;"
+    bel = "\x1b\\"
+    return f"{esc}{url}{bel}{label}{esc}{bel}"
+
+
+def wrap_line(prefix, text, width):
+    if width <= 0:
+        return []
+    first_width = max(1, width)
+    lines = textwrap.wrap(text, width=first_width) if text else [""]
+    if not lines:
+        lines = [""]
+    wrapped = []
+    first = lines[0]
+    wrapped.append(f"{prefix}{first}"[:width])
+    indent = " " * len(prefix)
+    for line in lines[1:]:
+        wrapped.append(f"{indent}{line}"[:width])
+    return wrapped
+
+
+def prompt_input(stdscr, y, prompt, current, width):
+    line = f"{prompt} [{current}]: "
+    safe_addstr(stdscr, y, 0, line[: width - 1])
+    try:
+        value = stdscr.getstr(y, min(len(line), width - 1)).decode("utf-8").strip()
+    except Exception:
+        value = ""
+    return value or current
+
+
+def settings_screen(stdscr):
+    global X_SEARCH_QUERY, NEWS_SCHEDULE, SHOW_LINKS
+    curses.echo()
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+
+    height, width = stdscr.getmaxyx()
+    stdscr.erase()
+    safe_addstr(stdscr, 0, 0, "Settings (leave blank to keep current)")
+    safe_addstr(
+        stdscr,
+        1,
+        0,
+        "News schedule format: HH:MM, comma-separated (24h).",
+    )
+    safe_addstr(
+        stdscr,
+        2,
+        0,
+        "Show in-post links? enter y/n.",
+    )
+
+    current_query = X_SEARCH_QUERY
+    current_schedule = ", ".join(NEWS_SCHEDULE)
+    current_links = "y" if SHOW_LINKS else "n"
+
+    new_query = prompt_input(stdscr, 4, "X search query", current_query, width)
+    new_schedule_input = prompt_input(
+        stdscr, 5, "News schedule", current_schedule, width
+    )
+    new_links_input = prompt_input(
+        stdscr, 6, "Show links", current_links, width
+    ).lower()
+    new_schedule = parse_schedule(new_schedule_input)
+    if not new_schedule:
+        new_schedule = NEWS_SCHEDULE
+    show_links = SHOW_LINKS
+    if new_links_input in ("y", "yes", "true", "1"):
+        show_links = True
+    elif new_links_input in ("n", "no", "false", "0"):
+        show_links = False
+
+    save_settings(new_query, new_schedule, show_links)
+    X_SEARCH_QUERY = new_query
+    NEWS_SCHEDULE = new_schedule
+    SHOW_LINKS = show_links
+
+    stdscr.erase()
+    safe_addstr(stdscr, 0, 0, "Settings saved. Press any key to return.")
+    stdscr.getkey()
+
+    curses.noecho()
+    stdscr.nodelay(True)
+    stdscr.timeout(0)
+
+
 def draw(stdscr, weather, news, now):
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
     title = "World Status - Toronto"
     clock = now.strftime("%A, %B %d %Y %H:%M:%S")
+    if curses.has_colors():
+        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
     safe_addstr(stdscr, 0, 0, title[: width - 1])
+    if curses.has_colors():
+        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.attron(curses.color_pair(1))
     safe_addstr(stdscr, 1, 0, clock[: width - 1])
+    if curses.has_colors():
+        stdscr.attroff(curses.color_pair(1))
 
+    if curses.has_colors():
+        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
     safe_addstr(stdscr, 3, 0, "Weather")
+    if curses.has_colors():
+        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
     if weather.get("error"):
+        if curses.has_colors():
+            stdscr.attron(curses.color_pair(5))
         safe_addstr(stdscr, 4, 0, f"  Error: {weather['error']}")
+        if curses.has_colors():
+            stdscr.attroff(curses.color_pair(5))
     else:
         w = parse_weather(weather)
         safe_addstr(
@@ -306,12 +496,26 @@ def draw(stdscr, weather, news, now):
             f"Wind {w['wind'] if w['wind'] is not None else 'N/A'} km/h {fmt_wind_dir(w['wind_dir'])}",
         )
 
-    safe_addstr(stdscr, 7, 0, f"News - X search: {X_SEARCH_QUERY}"[: width - 1])
+    schedule_text = ", ".join(NEWS_SCHEDULE) if NEWS_SCHEDULE else "manual"
+    if curses.has_colors():
+        stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+    safe_addstr(
+        stdscr,
+        7,
+        0,
+        f"News - X search: {X_SEARCH_QUERY} (schedule {schedule_text})"[: width - 1],
+    )
+    if curses.has_colors():
+        stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
     n = parse_news(news)
     if n["error"]:
+        if curses.has_colors():
+            stdscr.attron(curses.color_pair(5))
         safe_addstr(stdscr, 8, 0, f"  Error: {n['error']}"[: width - 1])
         if n.get("raw"):
             safe_addstr(stdscr, 9, 0, f"  Raw: {n['raw']}"[: width - 1])
+        if curses.has_colors():
+            stdscr.attroff(curses.color_pair(5))
     elif not n["items"]:
         safe_addstr(stdscr, 8, 0, "  No results")
     else:
@@ -319,11 +523,42 @@ def draw(stdscr, weather, news, now):
         for item in n["items"]:
             if y >= height - 1:
                 break
-            line = f"  @{item['user']} {fmt_time(item['time'])} - {item['text']}"
-            safe_addstr(stdscr, y, 0, line[: width - 1])
+            lines = wrap_line("  ", item["text"], width - 1)
+            for line in lines:
+                if y >= height - 1:
+                    break
+                safe_addstr(stdscr, y, 0, line)
+                y += 1
+            if y >= height - 1:
+                break
+            meta_label = f"@{item['user']} {fmt_time(item['time'])}"
+            meta = f"  {meta_label}"
+            if curses.has_colors():
+                stdscr.attron(curses.color_pair(4))
+            safe_addstr(stdscr, y, 0, meta[: width - 1])
+            if curses.has_colors():
+                stdscr.attroff(curses.color_pair(4))
+            y += 1
+            if y >= height - 1:
+                break
+            if SHOW_LINKS:
+                url = item.get("url", "")
+                if url:
+                    url_lines = wrap_line("  ", url, width - 1)
+                    for line in url_lines:
+                        if y >= height - 1:
+                            break
+                        if curses.has_colors():
+                            stdscr.attron(curses.color_pair(6))
+                        safe_addstr(stdscr, y, 0, line)
+                        if curses.has_colors():
+                            stdscr.attroff(curses.color_pair(6))
+                        y += 1
+            if y >= height - 1:
+                break
             y += 1
 
-    safe_addstr(stdscr, height - 1, 0, "Press q to quit")
+    safe_addstr(stdscr, height - 1, 0, "Press q to quit | s settings | r refresh")
     stdscr.refresh()
 
 
@@ -331,11 +566,11 @@ def dashboard(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(0)
+    init_colors()
 
     weather = {}
     news = {}
     last_weather_fetch = 0.0
-    last_news_fetch = 0.0
 
     while True:
         now = dt.datetime.now(ZoneInfo(TIMEZONE))
@@ -348,12 +583,10 @@ def dashboard(stdscr):
                 weather = {"error": str(exc)}
             last_weather_fetch = now_ts
 
-        if now_ts - last_news_fetch > NEWS_TTL_SECONDS or not news:
-            try:
-                news = get_news()
-            except Exception as exc:
-                news = {"error": str(exc)}
-            last_news_fetch = now_ts
+        try:
+            news = get_news(now, force=False)
+        except Exception as exc:
+            news = {"error": str(exc)}
 
         draw(stdscr, weather, news, now)
 
@@ -363,13 +596,24 @@ def dashboard(stdscr):
             key = None
         if key in ("q", "Q"):
             break
+        if key in ("r", "R"):
+            try:
+                news = get_news(now, force=True)
+            except Exception as exc:
+                news = {"error": str(exc)}
+        if key in ("s", "S"):
+            settings_screen(stdscr)
 
         time.sleep(1)
 
 
 def main():
-    ensure_xai_api_key()
-    curses.wrapper(dashboard)
+    try:
+        ensure_xai_api_key()
+        load_settings()
+        curses.wrapper(dashboard)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

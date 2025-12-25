@@ -15,6 +15,12 @@ pip install -r requirements.txt
 python3 dashboard.py
 ```
 
+Or run the launcher (creates/uses a venv and installs deps):
+
+```bash
+./run.sh
+```
+
 On first launch you will be prompted for your xAI API key, which is saved to `config.json`.
 You can also provide it via `XAI_API_KEY` to skip onboarding.
 
@@ -27,10 +33,37 @@ export X_SEARCH_QUERY="Toronto news OR Canada news"
 export X_MAX_RESULTS=6
 ```
 
-Press `q` to quit.
+Press `q` to quit. Press `s` for settings, `r` to refresh news.
 
 ## Notes
 
 - Weather is fetched from Open-Meteo (no API key required).
-- News uses xAI agentic X search tools and caches results for 30 minutes in `.cache/`.
+- News uses xAI agentic X search tools and caches results in `.cache/`.
 - Location is set to Toronto (lat/lon) and timezone `America/Toronto`.
+- Settings lets you toggle whether in-post links are shown.
+
+## Feed Structure
+
+Each post is rendered in this order:
+
+1. Post content (wrapped to terminal width)
+2. Poster handle + time
+3. Optional URL line(s) (if enabled)
+4. Blank line between posts
+
+## X Search Query Flow
+
+News fetch uses xAI agentic tool calling:
+
+1. Build a prompt that asks the model to search X for `X_SEARCH_QUERY`.
+2. The model uses `x_search` tool server-side.
+3. The model returns a JSON array with `text`, `author_handle`, `created_at`, `url`.
+4. Results are cached to `.cache/news.json` with `fetched_at` for schedule checks.
+
+## Quick Wins / Optimizations
+
+- Add `allowed_x_handles` filter to focus on trusted local sources.
+- Add date range filters (e.g., last 24h) for fresher results.
+- Add per-topic query presets (Toronto, Canada, Tech) via settings.
+- Post-process results: de-duplicate similar headlines and remove spammy posts.
+- Add relevance boosting by requiring keywords (e.g., "Toronto" AND "weather").
